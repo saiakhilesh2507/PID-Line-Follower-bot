@@ -1,0 +1,168 @@
+#include <Arduino.h>
+
+// ================= MOTOR PINS =================
+#define L_IN1 26
+#define L_IN2 27
+#define L_EN  14
+
+#define R_IN1 18
+#define R_IN2 19
+#define R_EN  25
+
+// PWM Constants for ESP32 v3.0+
+#define PWM_FREQ 5000
+#define PWM_RES  8
+
+// ================= SENSOR PINS =================
+#define NUM_SENSORS 6
+const int sensorPins[NUM_SENSORS] = {32, 33, 34, 35, 36, 39};
+
+// Calibration Storage
+int sensorMin[NUM_SENSORS];
+int sensorMax[NUM_SENSORS];
+
+// ================= CONTROL VARIABLES (MANUAL ENTRY) =================
+float KP = 1.7;  
+float KI = 0.149;   
+float KD = 10.0;  
+int BASE_SPEED = 140;
+
+#define MAX_SPEED 255
+
+float errorValue = 0;
+float previousError = 0;
+float pidOutput = 0;
+
+int leftSpeed = 0;
+int rightSpeed = 0;
+
+bool isCalibrated = false;
+
+// Variables for the 3-second safety timeout
+unsigned long lostLineTime = 0; 
+bool isLineLost = false;
+
+// ================= FUNCTION PROTOTYPES =================
+void stopMotors();
+void calibrateSensors();
+void applyMotors();
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  // Motor Pin Setup (Latest ESP32 Core API)
+  ledcAttach(L_EN, PWM_FREQ, PWM_RES);
+  ledcAttach(R_EN, PWM_FREQ, PWM_RES);
+  
+  pinMode(L_IN1, OUTPUT); pinMode(L_IN2, OUTPUT);
+  pinMode(R_IN1, OUTPUT); pinMode(R_IN2, OUTPUT);
+
+  for(int i=0; i<NUM_SENSORS; i++) {
+    pinMode(sensorPins[i], INPUT);
+    sensorMin[i] = 4095;
+    sensorMax[i] = 0;
+  }
+
+  // Automatic Calibration at Start
+  Serial.println("Starting Calibration in 2 seconds... Move bot over the line!");
+  delay(2000);
+  calibrateSensors();
+  Serial.println("Calibration Done. Starting Robot...");
+}
+
+// ================= LOOP =================
+void loop() {
+  if(!isCalibrated) return; 
+
+  int values[NUM_SENSORS];
+  long weightedSum = 0;
+  long sum = 0;
+  
+  // READ SENSORS
+  for(int i=0; i<NUM_SENSORS; i++){
+    int val = analogRead(sensorPins[i]);
+    val = constrain(val, sensorMin[i], sensorMax[i]);
+    values[i] = map(val, sensorMin[i], sensorMax[i], 0, 1000);
+    weightedSum += (long)values[i] * (i * 1000);
+    sum += values[i];
+  }
+
+  // SAFETY & ERROR LOGIC
+  if(sum < 500) { 
+    // Line is lost
+    if (!isLineLost) {
+      lostLineTime = millis();
+      isLineLost = true;
+    }
+    
+    // Check if 3 seconds have passed
+    if (millis() - lostLineTime > 5000) {
+      stopMotors();
+      Serial.println("LINE LOST: Halted.");
+      while(1); // Lock the bot until reset
+    }
+
+    // Maintain turn logic while looking for line
+    errorValue = (previousError > 0) ? 2500 : -2500;
+  } else {
+    // Line is detected
+    isLineLost = false; 
+    int position = weightedSum / sum;
+    errorValue = position - 2500; 
+  }
+
+  // PID CALCULATION
+  float derivative = errorValue - previousError;
+  pidOutput = (KP * errorValue) + (KD * derivative); 
+  previousError = errorValue;
+
+  leftSpeed = BASE_SPEED + pidOutput;
+  rightSpeed = BASE_SPEED - pidOutput;
+
+  leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
+  rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+
+  applyMotors();
+  delay(2); 
+}
+
+// ================= MOTOR FUNCTIONS =================
+
+void applyMotors(){
+  if(leftSpeed >= 0) {
+    digitalWrite(L_IN1, HIGH); digitalWrite(L_IN2, LOW);
+    ledcWrite(L_EN, leftSpeed);
+  } else {
+    digitalWrite(L_IN1, LOW); digitalWrite(L_IN2, HIGH); 
+    ledcWrite(L_EN, abs(leftSpeed));
+  }
+
+  if(rightSpeed >= 0) {
+    digitalWrite(R_IN1, HIGH); digitalWrite(R_IN2, LOW);
+    ledcWrite(R_EN, rightSpeed);
+  } else {
+    digitalWrite(R_IN1, LOW); digitalWrite(R_IN2, HIGH); 
+    ledcWrite(R_EN, abs(rightSpeed));
+  }
+}
+
+void stopMotors(){
+  ledcWrite(L_EN, 0); ledcWrite(R_EN, 0);
+  digitalWrite(L_IN1, LOW); digitalWrite(L_IN2, LOW);
+  digitalWrite(R_IN1, LOW); digitalWrite(R_IN2, LOW);
+}
+
+void calibrateSensors(){
+  isCalibrated = false;
+  unsigned long start = millis();
+  while(millis() - start < 5000){ 
+    for(int i=0; i<NUM_SENSORS; i++){
+      int val = analogRead(sensorPins[i]);
+      if(val > sensorMax[i]) sensorMax[i] = val;
+      if(val < sensorMin[i]) sensorMin[i] = val;
+    }
+    delay(5);
+  }
+  isCalibrated = true;
+}
